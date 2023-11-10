@@ -1,4 +1,5 @@
 import os
+import copy
 import torch
 import random
 from torch import nn
@@ -15,12 +16,12 @@ from torchvision import transforms, datasets
 from torch.optim.lr_scheduler import OneCycleLR
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.loggers import TensorBoardLogger
-from diffusers import UNet2DConditionModel, AutoencoderKL, DDPMScheduler, DPMSolverMultistepScheduler
+from diffusers import UNet2DConditionModel, AutoencoderKL, DDPMScheduler, DDIMScheduler
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 
 
 transform = T.ToPILImage()
-wandb_logger = WandbLogger(project="Diffusion-cat-dog-bird", log_model=True, name='128-long-DPMSolverMulti')
+wandb_logger = WandbLogger(project="Diffusion-cat-dog-bird", log_model=True, name='128-vae-DPMSolverMulti')
 
 
 @dataclass
@@ -28,12 +29,12 @@ class TrainingConfig:
     image_size = 128  # the generated image resolution
     train_batch_size = 256
     eval_batch_size = train_batch_size  # how many images to sample during evaluation
-    num_epochs = 250
-    gradient_accumulation_steps = 1
+    num_epochs = 300
+    gradient_accumulation_steps = 4
     learning_rate = 1e-4
     lr_warmup_steps = 500
     save_image_epochs = 10
-    num_workers = 30
+    num_workers = 22
     save_model_epochs = 30
     mixed_precision = 'fp16'  # `no` for float32, `fp16` for automatic mixed precision
     output_dir = 'cat-dogs-birds'  # the model namy locally and on the HF Hub
@@ -54,7 +55,7 @@ class DiffusionModel(pl.LightningModule):
         self.train_loader_len = train_loader_len
 
         self.last_image = ""
-        self.label_projection = nn.Embedding(3, 256)
+        self.label_projection = nn.Embedding(3, 64)
 
         # Initialize UNet model
         #self.unet = UNet_conditional(c_in=4, c_out=4, time_dim=256, num_classes=3, remove_deep_conv=False)
@@ -63,13 +64,13 @@ class DiffusionModel(pl.LightningModule):
         #                                                   subfolder="unet")
 
         self.unet = UNet2DConditionModel(
-                    sample_size=16,  # the target image resolution
+                    sample_size=self.config.image_size//8,  # the target image resolution
                     in_channels=4,  # the number of input channels, 3 for RGB images
                     out_channels=4,  # the number of output channels
                     layers_per_block=2,  # how many ResNet layers to use per UNet block
                     block_out_channels=(128, 256, 256, 512),  # the number of output channels for each UNet block , 256, 256, 512, 512
                     time_embedding_dim=256,
-                    encoder_hid_dim=256,
+                    encoder_hid_dim=64,
                     transformer_layers_per_block=2,
                     down_block_types=(
                         "CrossAttnDownBlock2D",  # a regular ResNet downsampling block
@@ -91,14 +92,27 @@ class DiffusionModel(pl.LightningModule):
         # Initialize VAE
         self.vae = AutoencoderKL.from_pretrained("CompVis/stable-diffusion-v1-4",
                                                   revision="fp16", torch_dtype=torch.float16,
-                                                  subfolder="vae")
+                                                  subfolder="vae").requires_grad_(False)
 
         # Initialize noise scheduler
         #self.noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
-        self.noise_scheduler = DPMSolverMultistepScheduler(num_train_timesteps=1000)
+        self.noise_scheduler = DDIMScheduler(num_train_timesteps=1000)
         self.noise_scheduler.set_timesteps(1000)
-        #self.noise_scheduler.set_timesteps(set_timesteps)
-        #self.noise_scheduler.timesteps = self.noise_scheduler.timesteps.to(torch.float32)
+
+        # Initialize EMA
+        self.ema_decay = 0.995  # You should define this in your config
+        self.ema_unet = copy.deepcopy(self.unet)
+        for param in self.ema_unet.parameters():
+            param.requires_grad_(False)
+
+    def update_ema(self):
+        with torch.no_grad():
+            model_params = dict(self.unet.named_parameters())
+            ema_params = dict(self.ema_unet.named_parameters())
+            for name in model_params:
+                model_param = model_params[name]
+                ema_param = ema_params[name]
+                ema_param.copy_(ema_param * self.ema_decay + (1.0 - self.ema_decay) * model_param)
 
     def forward(self, x, timesteps, hidden_embed):
         # Forward pass through UNet
@@ -128,9 +142,9 @@ class DiffusionModel(pl.LightningModule):
         clean_images, targets = batch
 
         # Encode the clean images to obtain latent representations
-        with torch.no_grad():
-            clean_latent = self.vae.encode(clean_images.to(torch.float16)).latent_dist.sample()
-            clean_latent = ((clean_latent * 2) - 1) * 0.18215
+        #with torch.no_grad():
+        clean_latent = self.vae.encode(clean_images.to(torch.float16)).latent_dist.sample() * 0.18215
+            #clean_latent = ((clean_latent * 2) - 1) 
 
         # Sample noise to add to the images
         noise = torch.randn(clean_latent.shape, device=self.device)
@@ -158,6 +172,10 @@ class DiffusionModel(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         loss = self.process_batch(batch)
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+
+        if self.current_epoch > 20:
+            self.update_ema()
+
         return loss
 
     # def validation_step(self, batch, batch_idx):
@@ -168,8 +186,8 @@ class DiffusionModel(pl.LightningModule):
     def latents_to_pil(self, latents):
         # batch of latents -> list of images
         latents = (1 / 0.18215) * latents
-        with torch.no_grad():
-            image = self.vae.decode(latents.to(torch.float16)).sample
+        #with torch.no_grad():
+        image = self.vae.decode(latents.to(torch.float16)).sample
         image = (image / 2 + 0.5).clamp(0, 1)
         image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
         images = (image * 255).round().astype("uint8")
@@ -178,9 +196,12 @@ class DiffusionModel(pl.LightningModule):
 
     def generate_and_save_images(self, current_epoch):
         generator = torch.manual_seed(42)
-        noise = torch.randn(1, 4, 16, 16, generator=generator).cuda()
+        noise = torch.randn(1, 4, self.config.image_size//8, self.config.image_size//8, generator=generator).cuda()
         label = self.label_projection(torch.tensor(random.randint(0, 2)).cuda())
         noise = noise * self.noise_scheduler.init_noise_sigma
+
+        original_unet = self.unet
+        self.unet = self.ema_unet
 
         for i, t in tqdm(enumerate(self.noise_scheduler.timesteps), total=len(self.noise_scheduler.timesteps)):
             noise = self.noise_scheduler.scale_model_input(noise, t)
@@ -192,6 +213,7 @@ class DiffusionModel(pl.LightningModule):
             noise = self.noise_scheduler.step(noise_pred, t.long(), noise).prev_sample
 
         decoded_noise = self.latents_to_pil(noise)
+        self.unet = original_unet
         
         # Save the generated images to a unique folder for the current epoch
         save_dir = f"generated_images/epoch_{current_epoch}"
@@ -264,6 +286,7 @@ def main():
         max_epochs=config.num_epochs,
         logger=[TensorBoardLogger("logs/", name="stable-diffusion"), wandb_logger],
         callbacks=[LearningRateMonitor(logging_interval="step"), ModelCheckpoint(monitor="train_loss_epoch", mode="min")],
+        accumulate_grad_batches=config.gradient_accumulation_steps
         #limit_train_batches=0.3, 
     )
 
